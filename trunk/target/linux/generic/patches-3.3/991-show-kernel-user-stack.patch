@@ -1,0 +1,197 @@
+Index: linux-3.3.8/arch/mips/kernel/process.c
+===================================================================
+--- linux-3.3.8.orig/arch/mips/kernel/process.c	2015-01-30 17:11:44.973012000 +0800
++++ linux-3.3.8/arch/mips/kernel/process.c	2015-01-30 12:00:07.188000000 +0800
+@@ -290,6 +290,39 @@
+ 	return 0;
+ }
+ 
++static int my_get_frame_info(struct mips_frame_info *info, unsigned long pc)
++{
++	union mips_instruction *ip = (union mips_instruction *)pc;
++	unsigned i;
++
++	info->pc_offset = -1;
++	info->frame_size = 0;
++
++	if (!ip)
++		goto err;
++
++	for (i = 0; ; i++, ip--) {
++		if (info->pc_offset == -1) {
++			if (is_ra_save_ins(ip)) {
++				info->pc_offset = ip->i_format.simmediate / sizeof(long);
++				continue;
++			}
++		}
++		if (info->frame_size == 0 && is_sp_move_ins(ip)) {
++			info->frame_size = - ip->i_format.simmediate;
++			break;
++		}
++	}
++	
++	if (info->frame_size && info->pc_offset >= 0) /* nested */
++		return 0;
++	if (info->pc_offset < 0) /* leaf */
++		return 1;
++	/* prologue seems boggus... */
++err:
++	return -1;
++}
++
+ static int get_frame_info(struct mips_frame_info *info)
+ {
+ 	union mips_instruction *ip = info->func;
+@@ -408,8 +441,10 @@
+ 		}
+ 		return 0;
+ 	}
++
+ 	if (!kallsyms_lookup_size_offset(pc, &size, &ofs))
+-		return 0;
++		/*return 0*/;
++
+ 	/*
+ 	 * Return ra if an exception occurred at the first instruction
+ 	 */
+@@ -421,7 +456,7 @@
+ 
+ 	info.func = (void *)(pc - ofs);
+ 	info.func_size = ofs;	/* analyze from start to ofs */
+-	leaf = get_frame_info(&info);
++	leaf = my_get_frame_info(&info, pc);
+ 	if (leaf < 0)
+ 		return 0;
+ 
+Index: linux-3.3.8/arch/mips/kernel/traps.c
+===================================================================
+--- linux-3.3.8.orig/arch/mips/kernel/traps.c	2015-01-30 17:11:27.945012000 +0800
++++ linux-3.3.8/arch/mips/kernel/traps.c	2015-01-30 17:13:54.913012000 +0800
+@@ -93,6 +93,110 @@
+ void (*board_bind_eic_interrupt)(int irq, int regset);
+ void (*board_ebase_setup)(void);
+ 
++#define USER_LEN 200
++int sysctl_user_len = USER_LEN;
++void show_user_raw_stack(void)
++{
++	struct pt_regs *regs;
++	unsigned long sp, pc, ra, frame_size;
++	int i=0;
++	unsigned long val;
++	int line = 0;
++	regs = task_pt_regs(current);
++	sp = regs->regs[29];
++	if(!current->mm)
++		return;
++	printk("current process:[%d %s]-[0x%lx] \n",current->pid,current->comm,regs->cp0_epc);
++
++	printk("dump user stack:");
++	for(i=0;i<sysctl_user_len;++i){
++		if (access_ok(VERIFY_READ, (unsigned long*)sp+i, sizeof(unsigned long)))
++		{
++			if(!(line%8))
++			printk("\n%p:",(unsigned long*)sp+i);
++			line++;
++			copy_from_user(&val, (unsigned long*)sp+i, sizeof(unsigned long));
++			printk("%08lx ",val);
++		}
++	}
++	printk("\ndump end\n");
++
++	printk("\nstart backtrace\n");
++	sp = regs->regs[29];
++	pc = regs->cp0_epc;
++	while(pc && pc<sp && pc>0x400000) {
++		i = 0;
++		while(1){
++			if (access_ok(VERIFY_READ, (unsigned long*)pc-i, sizeof(unsigned long))) {
++				copy_from_user(&val, (unsigned long*)pc-i, sizeof(unsigned long));
++				if ( 0xafbf0000 == (val & 0xffff0000)) {
++					frame_size = (val & 0xffff);
++					if (access_ok(VERIFY_READ, (unsigned long*)(sp+frame_size), sizeof(unsigned long))) {				
++						copy_from_user(&val, (unsigned long*)(sp+frame_size), sizeof(unsigned long));
++						ra = val;
++						printk("ra=%08lx \n", ra);
++						break;
++					}
++				}
++			}
++			i++;
++		}
++		pc = ra;
++		sp = sp+frame_size+4;
++	}
++	printk("\nend backtrace\n");
++}
++EXPORT_SYMBOL(show_user_raw_stack);
++
++extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, int write);
++void show_user_raw_stack_by_task(struct task_struct *task)
++{
++	struct pt_regs *regs;
++	unsigned long sp, pc, ra, frame_size;
++	int i=0;
++	unsigned long val;
++	int line = 0;
++	regs = task_pt_regs(task);
++	sp = regs->regs[29];
++	if(!task->mm)
++		return;
++	printk("current process:[%d %s]-[0x%lx] \n",task->pid,task->comm,regs->cp0_epc);
++
++	printk("dump user stack:");
++	for(i=0;i<sysctl_user_len;++i){
++		if(!(line%8))
++		printk("\n%p:",(unsigned long*)sp+i);
++		line++;
++		access_process_vm(task, (unsigned long)((unsigned long*)sp+i), &val, sizeof(unsigned long), 0);
++		printk("%08lx ",val);
++	}
++	printk("\ndump end\n");
++
++	printk("\nstart backtrace\n");
++	sp = regs->regs[29];
++	pc = regs->cp0_epc;
++	while(1) {
++		i = 0;
++		while(1){
++			access_process_vm(task, (unsigned long)((unsigned long*)pc-i), &val, sizeof(unsigned long), 0);
++			if ( 0xafbf0000 == (val & 0xffff0000)) {
++				frame_size = (val & 0xffff);
++				access_process_vm(task, sp+frame_size, &val, sizeof(unsigned long), 0);
++				ra = val;
++				break;
++			}
++			i++;
++		}
++		pc = ra;
++		sp = sp+frame_size+4;
++		if (pc && pc<sp && pc>0x400000)
++			printk("ra=%08lx \n", ra);
++		else
++			break;
++	}
++	printk("\nend backtrace\n");
++}
++EXPORT_SYMBOL(show_user_raw_stack_by_task);
+ 
+ static void show_raw_backtrace(unsigned long reg29)
+ {
+@@ -159,7 +263,7 @@
+ 
+ 	printk("Stack :");
+ 
+-	if (((unsigned long)sp & PAGE_MASK) == ((unsigned long)current_thread_info() + THREAD_SIZE - PAGE_SIZE))
++	/* if (((unsigned long)sp & PAGE_MASK) == ((unsigned long)current_thread_info() + THREAD_SIZE - PAGE_SIZE)) */
+ 		len = PAGE_SIZE - ((unsigned long) sp & (PAGE_SIZE - 1));
+ 	
+ 	for(i = 0; i < len/sizeof(unsigned long); i++){
+@@ -201,6 +305,7 @@
+ 	}
+ 	show_stacktrace(task, &regs);
+ }
++EXPORT_SYMBOL(show_stack);
+ 
+ /*
+  * The architecture-independent dump_stack generator
